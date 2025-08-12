@@ -56,4 +56,10 @@ dependencies {
     androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
+
+    implementation("org.tensorflow:tensorflow-lite:+")
+    implementation("org.tensorflow:tensorflow-lite-gpu:+")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:+")
+    implementation("org.tensorflow:tensorflow-lite-gpu-delegate-plugin:+")
+    implementation("org.tensorflow:tensorflow-lite-support:+")
 }

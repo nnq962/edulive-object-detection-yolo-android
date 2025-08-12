@@ -32,3 +32,6 @@ google-services.json
 
 # Android Profiling
 *.hprof
+
+# Bỏ qua thư mục assets chứa model
+app/src/main/assets/
