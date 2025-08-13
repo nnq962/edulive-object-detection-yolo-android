@@ -1,38 +1,32 @@
-// Top 1 android Edulive
 package com.example.objectdetection
 
+import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.GpuDelegate
 import android.content.Context
 import android.graphics.Bitmap
-import java.io.FileInputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import android.graphics.Matrix
+import android.os.SystemClock
+import org.tensorflow.lite.gpu.CompatibilityList
+import java.io.FileInputStream
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
-import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.CompatibilityList
-import org.tensorflow.lite.gpu.GpuDelegate
-import kotlin.math.exp
-import java.io.Closeable
+import android.util.Log
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
-class YoloDetector : Closeable {
+class YoloDetector(
+    val inputSize: Int = 640,
+    val channels: Int = 3,
+    val bytesPerChannel: Int = 4,
+    val batchSize: Int = 1,
+    val outputSize: Int = 8400,
+    val outputChannels: Int = 44,
+    val nmsThreshold: Float = 0.45f,
+    val accelerationMode: AccelerationMode = AccelerationMode.AUTO
+) {
+
     companion object {
-        private const val INPUT_SIZE = 640
-        private const val CHANNELS = 3
-        private const val BYTES_PER_CHANNEL = 4
-        private const val BATCH_SIZE = 1
-        private const val OUTPUT_SIZE = 8400
-        private const val OUTPUT_CHANNELS = 44
-
-        private val CLASS_NAMES = arrayOf(
-            "apple", "apricot", "avocado", "banana", "blueberry", "breadfruit",
-            "cantaloupe", "cherry", "coconut", "cranberry", "custard-apple",
-            "dragon-fruit", "durian", "grape", "guava", "kiwi", "lemon", "lime",
-            "longan", "lychee", "mango", "mangosteen", "mulberry", "orange",
-            "papaya", "passion-fruit", "peach", "pear", "persimmon", "pineapple",
-            "plum", "pomegranate", "pomelo", "rambutan", "sapodilla", "starfruit",
-            "strawberry", "tamarind", "watermelon", "winter-melon"
-        )
+        private const val TAG = "YoloDetector"
     }
 
     /**
@@ -40,7 +34,7 @@ class YoloDetector : Closeable {
      */
     data class Detection(
         val x: Float, val y: Float, val width: Float, val height: Float,
-        val confidence: Float, val classId: Int, val className: String
+        val confidence: Float, val classId: Int
     ) {
         fun getLeft(): Float = x - width / 2f
         fun getTop(): Float = y - height / 2f
@@ -48,181 +42,143 @@ class YoloDetector : Closeable {
         fun getBottom(): Float = y + height / 2f
     }
 
-    private var interpreter: Interpreter? = null
-    private var gpuDelegate: GpuDelegate? = null
-    private var hexagonDelegate: Any? = null // Hexagon delegate
-    private val confidenceThreshold = 0.5f
-    private val nmsThreshold = 0.45f
-    private fun sigmoid(x: Float): Float = 1f / (1f + exp(-x))
-
-
-    // Add acceleration mode enum
+    // Enum chọn chế độ tăng tốc
     enum class AccelerationMode {
-        CPU_ONLY,
+        CPU,
         GPU,
         NNAPI,
-        HEXAGON,
-        AUTO // Try delegates in order of preference
+        AUTO // Thử delegate theo thứ tự ưu tiên
     }
 
-    // Hàm này add thêm vào để chạy 1 lần nên đặt là predict
-    fun detect(bitmap: Bitmap, rotationDeg: Int, scoreThreshold: Float): Pair<List<Detection>, Long> {
-        val rotated = if (rotationDeg % 360 == 0) bitmap else {
-            val m = Matrix().apply { postRotate(rotationDeg.toFloat()) }
-            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
+    // Interpreter và GPU delegate (sẽ được khởi tạo sau)
+    var interpreter: Interpreter? = null
+    var gpuDelegate: GpuDelegate? = null
+
+    // Kết quả load
+    data class LoadResult(
+        val modeUsed: AccelerationMode,
+        val loadTimeMs: Long
+    )
+
+    // Thời gian từng bước
+    data class StepTimes(
+        val preprocessMs: Long,
+        val inferenceMs: Long,
+        val postprocessMs: Long,
+        val totalMs: Long
+    )
+
+    // Kết quả predict
+    data class PredictResult(
+        val detections: List<Detection>,
+        val times: StepTimes
+    )
+
+    fun loadModel(
+        context: Context,
+        assetModelPath: String,
+        mode: AccelerationMode = this.accelerationMode,
+        cpuNumThreads: Int = Runtime.getRuntime().availableProcessors().coerceAtMost(4)
+    ): LoadResult {
+        // Dọn tài nguyên cũ (nếu có)
+        interpreter?.close()
+        gpuDelegate?.close()
+        gpuDelegate = null
+
+        val modelBuffer = loadModelFromAssets(context, assetModelPath)
+
+        // Helper: build Interpreter từ options và đo thời gian
+        fun build(options: Interpreter.Options, usedMode: AccelerationMode): LoadResult {
+            val t0 = SystemClock.elapsedRealtimeNanos()
+            interpreter = Interpreter(modelBuffer, options)
+            val t1 = SystemClock.elapsedRealtimeNanos()
+            return LoadResult(usedMode, (t1 - t0) / 1_000_000) // ms
         }
-        val input = preprocessImage(rotated)
-        val t0 = System.currentTimeMillis()
-        val output = runInference(input)
-        val dt = System.currentTimeMillis() - t0
-        val dets = postprocessOutput(output, rotated.width, rotated.height, scoreThreshold)
-        return dets to dt
-    }
 
-    /**
-     * Post-processing: Chuyển output tensor thành danh sách detections
-     * @param output: Output tensor từ model [1,44,8400]
-     * @param originalWidth: Chiều rộng ảnh gốc (để scale coordinates)
-     * @param originalHeight: Chiều cao ảnh gốc (để scale coordinates)
-     * @param scoreThreshold: Ngưỡng confidence tối thiểu để giữ lại detection
-     * @return List of Detection objects
-     */
-    fun postprocessOutput(
-        output: Array<Array<FloatArray>>,
-        originalWidth: Int,
-        originalHeight: Int,
-        scoreThreshold: Float = 0.25f
-    ): List<Detection> {
-        val predictions = output[0] // Shape: [44,8400]
-        val validDetections = mutableListOf<Detection>()
+        // CPU options
+        fun cpuOptions() = Interpreter.Options().apply {
+            setNumThreads(cpuNumThreads)
+            Log.i(TAG, "Max CPUs: ${Runtime.getRuntime().availableProcessors()}")
+        }
 
-        for (i in 0 until OUTPUT_SIZE) { // 8400 detections
-            val centerX = predictions[0][i] * INPUT_SIZE
-            val centerY = predictions[1][i] * INPUT_SIZE
-            val width = predictions[2][i] * INPUT_SIZE
-            val height = predictions[3][i] * INPUT_SIZE
+        // GPU options (theo hướng dẫn bạn đưa)
+        fun gpuOptions(): Interpreter.Options? {
+            val compatList = CompatibilityList()
+            if (compatList.isDelegateSupportedOnThisDevice) {
+                val delegateOptions = compatList.bestOptionsForThisDevice
+                gpuDelegate = GpuDelegate(delegateOptions)
+                return Interpreter.Options().apply {
+                    // Tránh crash trên một số GPU khi đọc output
+                    setAllowBufferHandleOutput(false)
+                    addDelegate(gpuDelegate)
+                }
+            }
+            return null
+        }
 
-            // Find max class score
-            var maxConfidence = Float.NEGATIVE_INFINITY
-            var maxClassId = 0
+        // NNAPI options
+        fun nnapiOptions(): Interpreter.Options {
+            return Interpreter.Options().apply {
+                @Suppress("DEPRECATION")
+                setUseNNAPI(true)
+                // Hoặc: addDelegate(NnApiDelegate()) nếu muốn kiểm soát chi tiết hơn
+            }
+        }
 
-            for (classId in 0 until 40) {
-                val classScore = predictions[4 + classId][i]
-                if (classScore > maxConfidence) {
-                    maxConfidence = classScore
-                    maxClassId = classId
+        return when (mode) {
+            AccelerationMode.CPU -> {
+                build(cpuOptions(), AccelerationMode.CPU)
+            }
+
+            AccelerationMode.GPU -> {
+                val gpu = gpuOptions()
+                    ?: return build(cpuOptions(), AccelerationMode.CPU)
+                try {
+                    build(gpu, AccelerationMode.GPU)
+                } catch (_: Throwable) {  // Đổi từ "t" thành "_"
+                    gpuDelegate?.close()
+                    gpuDelegate = null
+                    build(cpuOptions(), AccelerationMode.CPU)
                 }
             }
 
-            if (maxConfidence > scoreThreshold) {
-                validDetections.add(
-                    Detection(
-                        x = centerX,
-                        y = centerY,
-                        width = width,
-                        height = height,
-                        confidence = maxConfidence,
-                        classId = maxClassId,
-                        className = CLASS_NAMES[maxClassId]
-                    )
-                )
-            }
-        }
-
-        // Apply NMS
-        val sortedDetections = validDetections.sortedByDescending { it.confidence }
-        val finalDetections = applyNMS(sortedDetections)
-
-        // Scale coordinates to original image size
-        val scaledDetections = scaleCoordinates(finalDetections, originalWidth, originalHeight)
-
-        // Limit max detections
-        return scaledDetections.take(50)
-    }
-
-    /**
-     * Apply Non-Maximum Suppression để loại bỏ duplicate detections
-     */
-    private fun applyNMS(detections: List<Detection>): List<Detection> {
-        if (detections.isEmpty()) return emptyList()
-
-        // Sort by confidence (descending)
-        val sortedDetections = detections.sortedByDescending { it.confidence }
-        val finalDetections = mutableListOf<Detection>()
-
-        for (detection in sortedDetections) {
-            var shouldKeep = true
-
-            // Check overlap với các detections đã chọn
-            for (finalDetection in finalDetections) {
-                val iou = calculateIoU(detection, finalDetection)
-                if (iou > nmsThreshold) {
-                    shouldKeep = false
-                    break
+            AccelerationMode.NNAPI -> {
+                try {
+                    build(nnapiOptions(), AccelerationMode.NNAPI)
+                } catch (_: Throwable) {
+                    // NNAPI lỗi → fallback CPU
+                    build(cpuOptions(), AccelerationMode.CPU)
                 }
             }
 
-            if (shouldKeep) {
-                finalDetections.add(detection)
+            AccelerationMode.AUTO -> {
+                // Thứ tự ưu tiên: GPU → NNAPI → CPU
+                // GPU
+                gpuOptions()?.let { gpuOpt ->
+                    try {
+                        return build(gpuOpt, AccelerationMode.GPU)
+                    } catch (_: Throwable) {
+                        gpuDelegate?.close()
+                        gpuDelegate = null
+                    }
+                }
+                // NNAPI
+                try {
+                    return build(nnapiOptions(), AccelerationMode.NNAPI)
+                } catch (_: Throwable) {
+                    // ignore
+                }
+                // CPU
+                build(cpuOptions(), AccelerationMode.CPU)
             }
         }
-
-        android.util.Log.i("YOLO", "🧹 NMS: ${detections.size} → ${finalDetections.size} detections")
-        return finalDetections
     }
 
-    /**
-     * Tính Intersection over Union (IoU) giữa 2 bounding boxes
-     */
-    private fun calculateIoU(det1: Detection, det2: Detection): Float {
-        val left = maxOf(det1.getLeft(), det2.getLeft())
-        val top = maxOf(det1.getTop(), det2.getTop())
-        val right = minOf(det1.getRight(), det2.getRight())
-        val bottom = minOf(det1.getBottom(), det2.getBottom())
-
-        if (left >= right || top >= bottom) return 0f
-
-        val intersection = (right - left) * (bottom - top)
-        val area1 = det1.width * det1.height
-        val area2 = det2.width * det2.height
-        val union = area1 + area2 - intersection
-
-        return if (union > 0f) intersection / union else 0f
-    }
-
-    /**
-     * Scale coordinates từ 640x640 về kích thước ảnh gốc
-     */
-    private fun scaleCoordinates(
-        detections: List<Detection>,
-        originalWidth: Int,
-        originalHeight: Int
-    ): List<Detection> {
-        val scaleX = originalWidth.toFloat() / INPUT_SIZE
-        val scaleY = originalHeight.toFloat() / INPUT_SIZE
-
-        // DEBUG: In scale factors
-        android.util.Log.i("YOLO", "🔍 Scale factors: scaleX=$scaleX, scaleY=$scaleY")
-
-        return detections.mapIndexed { index, detection ->
-            val scaledDetection = detection.copy(
-                x = detection.x * scaleX,
-                y = detection.y * scaleY,
-                width = detection.width * scaleX,
-                height = detection.height * scaleY
-            )
-
-            // DEBUG: Log coordinates cho detection đầu tiên
-            if (index == 0 && AppConfig.ENABLE_DEBUG_LOG) {
-                android.util.Log.i("YOLO", "🔍 Detection coordinate mapping:")
-                android.util.Log.i("YOLO", "  Original image: ${originalWidth}x${originalHeight}")
-                android.util.Log.i("YOLO", "  Scale factors: scaleX=$scaleX, scaleY=$scaleY")
-                android.util.Log.i("YOLO", "  Raw detection (640x640): center=(${detection.x}, ${detection.y}), size=(${detection.width}, ${detection.height})")
-                android.util.Log.i("YOLO", "  Scaled to original: center=(${scaledDetection.x}, ${scaledDetection.y}), size=(${scaledDetection.width}, ${scaledDetection.height})")
-                android.util.Log.i("YOLO", "  Bounding box: left=${scaledDetection.getLeft()}, top=${scaledDetection.getTop()}, right=${scaledDetection.getRight()}, bottom=${scaledDetection.getBottom()}")
-            }
-
-            scaledDetection
+    // ===== Helper: map model từ assets =====
+    private fun loadModelFromAssets(context: Context, assetPath: String): MappedByteBuffer {
+        val afd = context.assets.openFd(assetPath)
+        FileInputStream(afd.fileDescriptor).channel.use { fc ->
+            return fc.map(FileChannel.MapMode.READ_ONLY, afd.startOffset, afd.length)
         }
     }
 
@@ -231,14 +187,14 @@ class YoloDetector : Closeable {
      * @param bitmap: Ảnh đầu vào dạng Bitmap
      * @return ByteBuffer chứa tensor đã được xử lý với shape [1,640,640,3]
      */
-    fun preprocessImage(bitmap: Bitmap): ByteBuffer {
+    fun preprocess(bitmap: Bitmap): ByteBuffer {
 
         // Bước 1: Resize bitmap về 640x640 (stretch - không giữ tỷ lệ)
-        val resizedBitmap = resizeBitmapStretch(bitmap, INPUT_SIZE, INPUT_SIZE)
+        val resizedBitmap = resizeBitmapStretch(bitmap, inputSize, inputSize)
 
         // Bước 2: Tạo ByteBuffer với capacity phù hợp
         val inputBuffer = ByteBuffer.allocateDirect(
-            BATCH_SIZE * INPUT_SIZE * INPUT_SIZE * CHANNELS * BYTES_PER_CHANNEL
+            batchSize * inputSize * inputSize * channels * bytesPerChannel
         )
         inputBuffer.order(ByteOrder.nativeOrder()) // Thường là LITTLE_ENDIAN
 
@@ -314,308 +270,204 @@ class YoloDetector : Closeable {
         }
     }
 
+
     /**
-     * Load model with acceleration
+     * Post-processing: Chuyển output tensor thành danh sách detections
+     * @param output: Output tensor từ model [1,44,8400]
+     * @param originalWidth: Chiều rộng ảnh gốc (để scale coordinates)
+     * @param originalHeight: Chiều cao ảnh gốc (để scale coordinates)
+     * @param scoreThreshold: Ngưỡng confidence tối thiểu để giữ lại detection
+     * @return List of Detection objects
      */
-    fun loadModel(
-        context: Context, 
-        modelPath: String, 
-        numThreads: Int = 2,
-        delegate: Int = DELEGATE_CPU
-    ) {
-        try {
-            // Clean up any existing resources
-            close()
-            
-            val modelBuffer = loadModelFile(context, modelPath)
-            val options = Interpreter.Options().apply {
-                setNumThreads(numThreads.coerceIn(1, 4)) // Ensure valid thread count
-            }
+    fun postprocess(
+        output: Array<Array<FloatArray>>,
+        originalWidth: Int,
+        originalHeight: Int,
+        scoreThreshold: Float = 0.25f
+    ): List<Detection> {
+        val predictions = output[0] // Shape: [44,8400]
+        val validDetections = mutableListOf<Detection>()
 
-            setupAcceleration(options, delegate)
-            
-            // Create interpreter
-            interpreter = Interpreter(modelBuffer, options)
-            android.util.Log.i("YOLO", "🚀 Model loaded successfully!")
-            
-            logModelInfo()
+        for (i in 0 until outputSize) { // 8400 detections
+            val centerX = predictions[0][i] * inputSize
+            val centerY = predictions[1][i] * inputSize
+            val width = predictions[2][i] * inputSize
+            val height = predictions[3][i] * inputSize
 
-        } catch (e: Exception) {
-            android.util.Log.e("YOLO", "❌ Error loading model: ${e.message}")
-            // Clean up on failure
-            close()
-            throw e
-        }
-    }
+            // Find max class score
+            var maxConfidence = Float.NEGATIVE_INFINITY
+            var maxClassId = 0
 
-
-
-    private fun setupAcceleration(options: Interpreter.Options, delegate: Int): Boolean {
-        return when (delegate) {
-            DELEGATE_CPU -> {
-                android.util.Log.i("YOLO", "🖥️ Using CPU only")
-                options.setUseNNAPI(false)
-                options.setNumThreads(4) // Use 4 threads for CPU
-                true
-            }
-            DELEGATE_GPU -> {
-                val success = setupGpuDelegateSafe(options)
-                if (!success) {
-                    android.util.Log.w("YOLO", "🔄 GPU failed, using CPU with 4 threads")
-                    options.setUseNNAPI(false)
-                    options.setNumThreads(4) // Fallback to 4 threads
+            for (classId in 0 until 40) {
+                val classScore = predictions[4 + classId][i]
+                if (classScore > maxConfidence) {
+                    maxConfidence = classScore
+                    maxClassId = classId
                 }
-                success
             }
-            DELEGATE_NNAPI -> {
-                val success = setupNnapiDelegate(options)
-                if (!success) {
-                    android.util.Log.w("YOLO", "🔄 NNAPI failed, using CPU with 4 threads")
-                    options.setUseNNAPI(false)
-                    options.setNumThreads(4) // Fallback to 4 threads
+
+            if (maxConfidence > scoreThreshold) {
+                validDetections.add(
+                    Detection(
+                        x = centerX,
+                        y = centerY,
+                        width = width,
+                        height = height,
+                        confidence = maxConfidence,
+                        classId = maxClassId
+                    )
+                )
+            }
+        }
+
+        // Apply NMS
+        val sortedDetections = validDetections.sortedByDescending { it.confidence }
+        val finalDetections = applyNMS(sortedDetections)
+
+        // Scale coordinates to original image size
+        val scaledDetections = scaleCoordinates(finalDetections, originalWidth, originalHeight)
+
+        // Limit max detections
+        return scaledDetections.take(50)
+    }
+
+
+    /**
+     * Apply Non-Maximum Suppression để loại bỏ duplicate detections
+     */
+    private fun applyNMS(detections: List<Detection>): List<Detection> {
+        if (detections.isEmpty()) return emptyList()
+
+        // Sort by confidence (descending)
+        val sortedDetections = detections.sortedByDescending { it.confidence }
+        val finalDetections = mutableListOf<Detection>()
+
+        for (detection in sortedDetections) {
+            var shouldKeep = true
+
+            // Check overlap với các detections đã chọn
+            for (finalDetection in finalDetections) {
+                val iou = calculateIoU(detection, finalDetection)
+                if (iou > nmsThreshold) {
+                    shouldKeep = false
+                    break
                 }
-                success
             }
-            else -> {
-                android.util.Log.i("YOLO", "🖥️ Unknown delegate, using CPU")
-                options.setUseNNAPI(false)
-                options.setNumThreads(4)
-                true
+
+            if (shouldKeep) {
+                finalDetections.add(detection)
             }
         }
+        return finalDetections
     }
 
-    private fun setupGpuDelegateSafe(options: Interpreter.Options): Boolean {
-        return try {
-            android.util.Log.i("YOLO", "🔍 Attempting GPU delegate creation...")
+    /**
+     * Tính Intersection over Union (IoU) giữa 2 bounding boxes
+     */
+    private fun calculateIoU(
+        det1: Detection,
+        det2: Detection
+    ): Float {
+        val left = maxOf(det1.getLeft(), det2.getLeft())
+        val top = maxOf(det1.getTop(), det2.getTop())
+        val right = minOf(det1.getRight(), det2.getRight())
+        val bottom = minOf(det1.getBottom(), det2.getBottom())
 
-            val compatList = CompatibilityList()
-            android.util.Log.i("YOLO", "🔍 GPU compatibility check: ${compatList.isDelegateSupportedOnThisDevice}")
+        if (left >= right || top >= bottom) return 0f
 
-            if (compatList.isDelegateSupportedOnThisDevice) {
-                // Clean up any existing GPU delegate first
-                gpuDelegate?.close()
-                gpuDelegate = null
-                
-                // Use EXACTLY the same approach that works on your device
-                val delegateOptions = compatList.bestOptionsForThisDevice
-                android.util.Log.i("YOLO", "🔍 Creating GPU delegate with bestOptionsForThisDevice...")
-                gpuDelegate = GpuDelegate(delegateOptions)
-                
-                // Add the delegate to options
-                options.addDelegate(gpuDelegate)
-                android.util.Log.i("YOLO", "✅ GPU Delegate created successfully with bestOptions!")
-                true
-            } else {
-                android.util.Log.w("YOLO", "⚠️ GPU not supported on this device, will use CPU with 4 threads")
-                options.setNumThreads(4)
-                false
-            }
-        } catch (e: Exception) {
-            android.util.Log.e("YOLO", "❌ GPU Delegate failed: ${e.message}")
-            android.util.Log.e("YOLO", "❌ Exception: ${e.javaClass.simpleName}")
-            e.printStackTrace()
-            
-            // Clean up failed delegate
-            try {
-                gpuDelegate?.close()
-            } catch (closeException: Exception) {
-                android.util.Log.w("YOLO", "Failed to close GPU delegate: ${closeException.message}")
-            }
-            gpuDelegate = null
-            
-            // Fallback to CPU with 4 threads
-            options.setNumThreads(4)
-            false
-        }
+        val intersection = (right - left) * (bottom - top)
+        val area1 = det1.width * det1.height
+        val area2 = det2.width * det2.height
+        val union = area1 + area2 - intersection
+
+        return if (union > 0f) intersection / union else 0f
     }
 
-    private fun setupNnapiDelegate(options: Interpreter.Options): Boolean {
-        return try {
-            options.setUseNNAPI(true)
-            android.util.Log.i("YOLO", "✅ NNAPI Delegate enabled")
-            true
-        } catch (e: Exception) {
-            android.util.Log.w("YOLO", "⚠️ NNAPI failed: ${e.message}")
-            options.setUseNNAPI(false)
-            false
+    /**
+     * Scale coordinates từ 640x640 về kích thước ảnh gốc
+     */
+    private fun scaleCoordinates(
+        detections: List<Detection>,
+        originalWidth: Int,
+        originalHeight: Int
+    ): List<Detection> {
+        val scaleX = originalWidth.toFloat() / inputSize
+        val scaleY = originalHeight.toFloat() / inputSize
+
+        return detections.mapIndexed { index, detection ->
+            val scaledDetection = detection.copy(
+                x = detection.x * scaleX,
+                y = detection.y * scaleY,
+                width = detection.width * scaleX,
+                height = detection.height * scaleY
+            )
+            scaledDetection
         }
     }
 
 
     /**
-     * Chạy inference với input tensor
-     * @param inputBuffer: Tensor đầu vào đã preprocessing
-     * @return Output tensor với shape [1,44,8400]
+     * Inference: nhận ByteBuffer đầu vào và trả về output tensor [1, 44, 8400]
+     * Chỉ làm nhiệm vụ chạy model (không đo thời gian ở đây để giữ hàm "sạch").
      */
-    fun runInference(inputBuffer: ByteBuffer): Array<Array<FloatArray>> {
-        val interpreter = this.interpreter
-            ?: throw IllegalStateException("Model chưa được load! Gọi loadModel() trước.")
+    fun inference(inputBuffer: ByteBuffer): Array<Array<FloatArray>> {
+        val tflite = interpreter ?: throw IllegalStateException("Interpreter is not initialized. Call loadModel() first.")
 
-        // Tạo output buffer với shape [1,44,8400]
-        val output = Array(BATCH_SIZE) {
-            Array(OUTPUT_CHANNELS) {
-                FloatArray(OUTPUT_SIZE)
-            }
-        }
+        // Tạo vùng nhớ cho output: [1, 44, 8400]
+        val output = Array(batchSize) { Array(outputChannels) { FloatArray(outputSize) } }
 
-        try {
-            // Reset input buffer position
-            inputBuffer.rewind()
-
-            // Validate input buffer size
-            val expectedSize = BATCH_SIZE * INPUT_SIZE * INPUT_SIZE * CHANNELS * BYTES_PER_CHANNEL
-            if (inputBuffer.capacity() != expectedSize) {
-                throw IllegalArgumentException("Input buffer size mismatch. Expected: $expectedSize, Got: ${inputBuffer.capacity()}")
-            }
-
-            // Đo thời gian inference
-            val startTime = System.currentTimeMillis()
-
-            // Chạy model với try-catch để bắt GPU crashes
-            interpreter.run(inputBuffer, output)
-
-            val inferenceTime = System.currentTimeMillis() - startTime
-            android.util.Log.d("YOLO", "⚡ Inference time: ${inferenceTime}ms")
-
-            return output
-
-        } catch (e: Exception) {
-            android.util.Log.e("YOLO", "❌ Error during inference: ${e.message}")
-            android.util.Log.e("YOLO", "❌ Exception type: ${e.javaClass.simpleName}")
-            
-            // If it's a native crash or GPU-related error, we should recreate the interpreter
-            if (e.message?.contains("native") == true || 
-                e.message?.contains("GPU") == true || 
-                e is RuntimeException) {
-                android.util.Log.w("YOLO", "⚠️ Possible GPU delegate issue detected, consider fallback to CPU")
-            }
-            
-            throw e
-        }
-    }
-
-    /**
-     * Load model file từ assets
-     */
-    private fun loadModelFile(context: Context, modelPath: String): MappedByteBuffer {
-        val fileDescriptor = context.assets.openFd(modelPath)
-        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
-        val fileChannel = inputStream.channel
-        val startOffset = fileDescriptor.startOffset
-        val declaredLength = fileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
-    }
-
-    private fun isGpuSupported(): Boolean {
-        return try {
-            val compatibilityList = CompatibilityList()
-            compatibilityList.isDelegateSupportedOnThisDevice
-        } catch (e: Exception) {
-            android.util.Log.w("YOLO", "Cannot check GPU support: ${e.message}")
-            false
-        }
-    }
-
-    /**
-     * Log thông tin model (for debugging)
-     */
-    private fun logModelInfo() {
-        val interpreter = this.interpreter ?: return
-
-        try {
-            android.util.Log.i("YOLO", "📊 Model Info:")
-            android.util.Log.i("YOLO", "  Input count: ${interpreter.inputTensorCount}")
-            android.util.Log.i("YOLO", "  Output count: ${interpreter.outputTensorCount}")
-
-            // Input tensor info
-            val inputTensor = interpreter.getInputTensor(0)
-            android.util.Log.i("YOLO", "  Input shape: ${inputTensor.shape().contentToString()}")
-            android.util.Log.i("YOLO", "  Input type: ${inputTensor.dataType()}")
-
-            // Output tensor info
-            val outputTensor = interpreter.getOutputTensor(0)
-            android.util.Log.i("YOLO", "  Output shape: ${outputTensor.shape().contentToString()}")
-            android.util.Log.i("YOLO", "  Output type: ${outputTensor.dataType()}")
-
-        } catch (e: Exception) {
-            android.util.Log.w("YOLO", "Cannot get model info: ${e.message}")
-        }
-    }
-
-    /**
-     * Kiểm tra shape của tensor đã tạo (for debugging)
-     */
-    fun getTensorShape(): IntArray {
-        return intArrayOf(BATCH_SIZE, INPUT_SIZE, INPUT_SIZE, CHANNELS)
-    }
-
-    /**
-     * Tính kích thước ByteBuffer cần thiết
-     */
-    fun getInputBufferSize(): Int {
-        return BATCH_SIZE * INPUT_SIZE * INPUT_SIZE * CHANNELS * BYTES_PER_CHANNEL
+        // Đảm bảo vị trí đọc buffer ở đầu
+        inputBuffer.rewind()
+        tflite.run(inputBuffer, output)
+        return output
     }
 
 
     /**
-     * Debug function để test các acceleration modes
+     * Predict: thực hiện đủ 3 bước preprocess -> inference -> postprocess
+     * Trả về danh sách detection và thời gian từng bước (ms).
      */
-    fun debugAccelerationSupport(context: Context) {
-        android.util.Log.i("YOLO", "🔍 === TESTING ACCELERATION SUPPORT ===")
+    fun predict(
+        bitmap: Bitmap,
+        scoreThreshold: Float = 0.25f
+    ): PredictResult {
+        val originalW = bitmap.width
+        val originalH = bitmap.height
 
-        // Test GPU Compatibility Check
-        android.util.Log.i("YOLO", "📱 Testing GPU compatibility...")
-        try {
-            val compatibilityList = CompatibilityList()
-            val isGpuSupported = compatibilityList.isDelegateSupportedOnThisDevice
-            android.util.Log.i("YOLO", "  GPU compatibility: $isGpuSupported")
+        // --- Preprocess ---
+        val t0 = SystemClock.elapsedRealtimeNanos()
+        val inputBuffer = preprocess(bitmap)
+        val t1 = SystemClock.elapsedRealtimeNanos()
 
-            if (isGpuSupported) {
-                val bestOptions = compatibilityList.bestOptionsForThisDevice
-                android.util.Log.i("YOLO", "  Best GPU options available: $bestOptions")
-            }
+        // --- Inference ---
+        val t2 = SystemClock.elapsedRealtimeNanos()
+        val output = inference(inputBuffer)
+        val t3 = SystemClock.elapsedRealtimeNanos()
 
-        } catch (e: Exception) {
-            android.util.Log.e("YOLO", "  ❌ GPU compatibility test failed: ${e.message}")
-        }
+        // --- Postprocess ---
+        val t4 = SystemClock.elapsedRealtimeNanos()
+        val detections = postprocess(
+            output = output,
+            originalWidth = originalW,
+            originalHeight = originalH,
+            scoreThreshold = scoreThreshold
+        )
+        val t5 = SystemClock.elapsedRealtimeNanos()
 
-        // Test NNAPI
-        android.util.Log.i("YOLO", "🧠 Testing NNAPI support...")
-        try {
-            val testOptions = Interpreter.Options()
-            testOptions.setUseNNAPI(true)
-            android.util.Log.i("YOLO", "  ✅ NNAPI seems available")
-        } catch (e: Exception) {
-            android.util.Log.e("YOLO", "  ❌ NNAPI test failed: ${e.message}")
-        }
+        val preprocessMs  = (t1 - t0) / 1_000_000
+        val inferenceMs   = (t3 - t2) / 1_000_000
+        val postprocessMs = (t5 - t4) / 1_000_000
+        val totalMs       = (t5 - t0) / 1_000_000
 
-        // Test CPU
-        android.util.Log.i("YOLO", "🖥️ CPU always available")
-
-        android.util.Log.i("YOLO", "🏁 === ACCELERATION TEST COMPLETED ===")
-        android.util.Log.i("YOLO", "💡 Recommendation: Try AUTO mode to fallback gracefully")
+        return PredictResult(
+            detections = detections,
+            times = StepTimes(
+                preprocessMs = preprocessMs,
+                inferenceMs = inferenceMs,
+                postprocessMs = postprocessMs,
+                totalMs = totalMs
+            )
+        )
     }
 
-    /**
-     * Clean up resources including delegates
-     */
-    override fun close() {
-        interpreter?.close()
-        gpuDelegate?.close()
-
-        hexagonDelegate?.let { delegate ->
-            try {
-                val closeMethod = delegate.javaClass.getMethod("close")
-                closeMethod.invoke(delegate)
-            } catch (e: Exception) {
-                android.util.Log.w("YOLO", "Failed to close Hexagon delegate: ${e.message}")
-            }
-        }
-
-        interpreter = null
-        gpuDelegate = null
-        hexagonDelegate = null
-        android.util.Log.i("YOLO", "🧹 YoloDetector closed")
-    }
 }
