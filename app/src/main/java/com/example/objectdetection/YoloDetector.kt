@@ -13,6 +13,13 @@ import java.nio.channels.FileChannel
 import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import kotlin.math.max
+import java.util.Locale
+import kotlin.math.min
 
 class YoloDetector(
     val inputSize: Int = 640,
@@ -470,4 +477,93 @@ class YoloDetector(
         )
     }
 
+
+    /**
+     * Vẽ danh sách detections lên ảnh gốc.
+     * @param src  Ảnh gốc (sẽ tạo bản copy để vẽ)
+     * @param detections  Danh sách bbox đã scale về ảnh gốc (từ postprocess)
+     * @param labels  Danh sách tên lớp (có thể null). Nếu null sẽ in "id:<classId>"
+     * @return Bitmap mới đã được vẽ bbox + label
+     */
+    fun drawDetectionsOnBitmap(
+        src: Bitmap,
+        detections: List<Detection>,
+        labels: List<String>? = null
+    ): Bitmap {
+        val out = src.copy(Bitmap.Config.ARGB_8888, true)
+        val canvas = Canvas(out)
+
+        val stroke = max(out.width, out.height) / 300f
+        val textSize = max(out.width, out.height) / 40f
+
+        val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = stroke.coerceAtLeast(2f)
+        }
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            this.textSize = textSize
+        }
+        val textBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.argb(160, 0, 0, 0)
+        }
+
+        val textPadding = (textSize * 0.3f)
+
+        detections.forEach { det ->
+            val l = det.getLeft()
+            val t = det.getTop()
+            val r = det.getRight()
+            val b = det.getBottom()
+
+            // clamp bbox vào ảnh (tránh tràn khi vẽ label bên trong)
+            val boxLeft   = max(0f, l)
+            val boxTop    = max(0f, t)
+            val boxRight  = min(out.width.toFloat(), r)
+            val boxBottom = min(out.height.toFloat(), b)
+
+            // Màu theo class
+            boxPaint.color = colorForClass(det.classId)
+
+            // Vẽ khung
+            canvas.drawRect(RectF(boxLeft, boxTop, boxRight, boxBottom), boxPaint)
+
+            // ----- Vẽ LABEL BÊN TRONG, SÁT CẠNH TRÊN CỦA BBOX -----
+            val labelText = buildString {
+                append(labels?.getOrNull(det.classId) ?: "id:${det.classId}")
+                append(" ")
+                append(String.format(Locale.US, "%.2f", det.confidence))
+            }
+
+            val textWidth = textPaint.measureText(labelText)
+            val textHeight = textPaint.fontMetrics.run { bottom - top }
+            val labelHeight = textHeight + 2 * textPadding
+            val labelWidth = textWidth + 2 * textPadding
+
+            // Nếu bbox quá thấp cho label ở mép trên, ta dời xuống dưới bên trong bbox
+            val fitsTop = (boxBottom - boxTop) >= labelHeight
+            val fitsLeft = (boxRight - boxLeft) >= labelWidth
+
+            val bgLeft = boxLeft
+            val bgTop = if (fitsTop) boxTop else (boxBottom - labelHeight).coerceAtLeast(0f)
+            val bgRight = if (fitsLeft) (bgLeft + labelWidth) else boxRight
+            val bgBottom = (bgTop + labelHeight).coerceAtMost(out.height.toFloat())
+
+            // nền label
+            canvas.drawRect(bgLeft, bgTop, bgRight, bgBottom, textBgPaint)
+            // chữ (canh theo baseline)
+            val textX = bgLeft + textPadding
+            val textY = bgBottom - textPadding - textPaint.fontMetrics.bottom
+            canvas.drawText(labelText, textX, textY, textPaint)
+        }
+
+        return out
+    }
+
+    // Màu theo classId (HSV → ARGB) để dễ phân biệt lớp
+    private fun colorForClass(classId: Int): Int {
+        val hue = (classId * 37) % 360 // xoay màu
+        return Color.HSVToColor(200, floatArrayOf(hue.toFloat(), 0.9f, 1f)) // alpha 200/255
+    }
 }
